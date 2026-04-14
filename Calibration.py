@@ -92,8 +92,8 @@ except ImportError:
 # =============================================================================
 
 # KLC101 identification. Use SN (preferred) or port. None = auto-detect.
-SN_LCVR1   = None          # e.g. '39000001'  — LCVR 1, slow axis 22.5 deg
-SN_LCVR2   = None          # e.g. '39000002'  — LCVR 2, slow axis 45 deg
+SN_LCVR1   = '39443416'          # e.g. '39000001'  — LCVR 1, slow axis 22.5 deg
+SN_LCVR2   = '39443413'          # e.g. '39000002'  — LCVR 2, slow axis 45 deg
 PORT_LCVR1 = None          # e.g. '/dev/tty.usbserial-XXXX'
 PORT_LCVR2 = None          # e.g. '/dev/tty.usbserial-YYYY'
 
