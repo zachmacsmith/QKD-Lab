@@ -1,0 +1,559 @@
+"""
+BB84 QKD Experiment Controller
+================================
+Alice prepares polarization states using two LCC1511 LCVRs controlled by KLC101s.
+Bob manually enters his measurement basis; results are recorded from a PBS + detector pair.
+
+Architecture
+------------
+- KLC101Controller : wraps KLCserial.KLC for one device
+- DetectorInterface: wraps your time-tagger / counter card
+- HardwareLayer    : aggregates both controllers + detector, owns state voltage map
+- BB84Protocol     : all protocol logic (basis choice, sifting, bit assignment)
+- ExperimentRunner : orchestrates a full run
+
+Dependencies
+------------
+    pip install serial pyserial KLCserial
+
+LCVR physical setup
+-------------------
+    LCVR 1 slow axis at 22.5 deg  ->  switches basis  (H/V <-> D/A)
+    LCVR 2 slow axis at 45 deg    ->  flips bit within basis (H<->V or D<->A)
+
+    Voltage map (H-polarised input, PBS downstream):
+        LCVR1 V_HIGH, LCVR2 V_HIGH  ->  H
+        LCVR1 V_LOW,  LCVR2 V_HIGH  ->  D
+        LCVR1 V_HIGH, LCVR2 V_LOW   ->  V
+        LCVR1 V_LOW,  LCVR2 V_LOW   ->  A
+"""
+
+import random
+import time
+import csv
+import json
+import datetime
+import pathlib
+from dataclasses import dataclass
+from typing import Optional
+from enum import Enum
+
+try:
+    from KLCserial import KLC as _KLC
+    KLCSERIAL_AVAILABLE = True
+except ImportError:
+    KLCSERIAL_AVAILABLE = False
+
+
+# =============================================================================
+# ENUMS AND DATA STRUCTURES
+# =============================================================================
+
+class Basis(Enum):
+    HV = 0
+    DA = 1
+
+
+class Bit(Enum):
+    ZERO = 0
+    ONE  = 1
+
+
+class DetectorPort(Enum):
+    H_PORT = 0   # H in HV basis, D in DA basis
+    V_PORT = 1   # V in HV basis, A in DA basis
+
+
+@dataclass
+class AliceState:
+    basis: Basis
+    bit:   Bit
+
+    @property
+    def label(self):
+        return {
+            (Basis.HV, Bit.ZERO): "H",
+            (Basis.HV, Bit.ONE):  "V",
+            (Basis.DA, Bit.ZERO): "D",
+            (Basis.DA, Bit.ONE):  "A",
+        }[(self.basis, self.bit)]
+
+    def __hash__(self):
+        return hash((self.basis, self.bit))
+
+    def __eq__(self, other):
+        return self.basis == other.basis and self.bit == other.bit
+
+
+@dataclass
+class MeasurementRecord:
+    round_number:  int
+    alice_basis:   Basis
+    alice_bit:     Bit
+    alice_state:   str
+    bob_basis:     Basis
+    detector_port: Optional[DetectorPort]
+    bases_match:   bool
+    sifted_bit:    Optional[int]
+
+
+# =============================================================================
+# HARDWARE LAYER
+# =============================================================================
+
+class KLC101Controller:
+    """
+    Thin wrapper around KLCserial.KLC for a single KLC101.
+
+    To swap to a different library, only modify this class.
+
+    Parameters
+    ----------
+    port     : e.g. '/dev/ttyUSB0' or 'COM3'. None = auto-detect.
+    sn       : Serial number string e.g. '39123456'. None = auto-detect.
+    v_high   : Voltage for near-zero retardance (identity). Default 20 V.
+    simulate : Skip all hardware calls and print instead.
+    """
+
+    def __init__(self, port=None, sn=None, v_high=20.0, simulate=False):
+        self.port     = port
+        self.sn       = sn
+        self.v_high   = v_high
+        self.simulate = simulate
+        self._klc     = None
+        self._label   = sn or port or "auto"
+
+    def connect(self):
+        if self.simulate:
+            print(f"  [SIM] KLC101 ({self._label}): connected")
+            return
+        if not KLCSERIAL_AVAILABLE:
+            raise RuntimeError("Run: pip install serial pyserial KLCserial")
+        if self.sn:
+            self._klc = _KLC(SN=self.sn)
+        elif self.port:
+            self._klc = _KLC(port=self.port)
+        else:
+            self._klc = _KLC()
+        self._klc.en_hwchan()
+        self._klc.set_chan_mode(mode=1)  # use preset 1 throughout
+        print(f"  KLC101 ({self._label}): connected")
+
+    def disconnect(self):
+        if self.simulate:
+            return
+        if self._klc is not None:
+            self._klc.dis_hwchan()
+            self._klc.closeKLC()
+
+    def set_voltage(self, voltage, freq_hz=2000):
+        """
+        Set preset-1 voltage and carrier frequency.
+
+        voltage : 0-25 V  — controls retardance
+        freq_hz : 500-10000 Hz — carrier frequency, does NOT control retardance
+        """
+        if self.simulate:
+            print(f"  [SIM] KLC101 ({self._label}): V={voltage:.3f} V  f={freq_hz} Hz")
+            return
+        self._klc.set_voltage(voltage)
+        self._klc.set_freq(int(freq_hz))
+
+
+class DetectorInterface:
+    """
+    Swabian Instruments Time Tagger interface for the PBS detectors.
+
+    Loads calibration (efficiency ratio, dark rates, channel mapping) from
+    calibration.json generated by calibrate.py. Must be run before use.
+
+    Detection applies:
+      1. Dark count subtraction
+      2. Efficiency ratio correction to equalise detector response
+
+    Channel mapping (kit default):
+        channel_h = 1  (Detector T, H-port of PBS)
+        channel_v = 2  (Detector A, V-port of PBS)
+    """
+
+    CALIBRATION_FILE = pathlib.Path(__file__).parent / "calibration.json"
+
+    def __init__(self, integration_time_s=0.5, simulate=False, error_rate=0.02):
+        self.integration_time_s = integration_time_s
+        self.simulate           = simulate
+        self.error_rate         = error_rate
+
+        # Populated by load_calibration()
+        self.channel_h         = 1
+        self.channel_v         = 2
+        self.efficiency_ratio  = 1.0
+        self.dark_rate_h       = 0.0
+        self.dark_rate_v       = 0.0
+        self.extinction_ratios = {}
+
+        self._tagger    = None
+        self._countrate = None
+        self._TT        = None
+
+    def load_calibration(self) -> dict:
+        """Load calibration.json written by calibrate.py."""
+        if not self.CALIBRATION_FILE.exists():
+            raise FileNotFoundError(
+                f"Calibration file not found: {self.CALIBRATION_FILE}\n"
+                "Run calibrate.py before starting the experiment."
+            )
+        with open(self.CALIBRATION_FILE) as f:
+            cal = json.load(f)
+
+        self.channel_h         = cal["channel_h"]
+        self.channel_v         = cal["channel_v"]
+        self.efficiency_ratio  = cal["efficiency_ratio"]
+        self.dark_rate_h       = cal["dark_rate_h"]
+        self.dark_rate_v       = cal["dark_rate_v"]
+        self.extinction_ratios = cal.get("extinction_ratios", {})
+
+        age_h = (
+            datetime.datetime.now()
+            - datetime.datetime.fromisoformat(cal["timestamp"])
+        ).total_seconds() / 3600
+
+        print(f"  Calibration loaded: {self.CALIBRATION_FILE}")
+        print(f"  Timestamp     : {cal['timestamp']}  ({age_h:.1f} h ago)")
+        print(f"  Efficiency ratio : {self.efficiency_ratio:.3f}")
+        print(f"  Dark rates       : H={self.dark_rate_h:.1f} Hz  "
+              f"V={self.dark_rate_v:.1f} Hz")
+        if self.extinction_ratios:
+            print("  Extinction ratios: " +
+                  "  ".join(f"{k}={v:.1f}" for k, v in self.extinction_ratios.items()))
+        if age_h > 4:
+            print(f"  WARNING: Calibration is {age_h:.1f} h old — consider re-running calibrate.py")
+        return cal
+
+    def connect(self) -> None:
+        if self.simulate:
+            print("  [SIM] Detector: connected")
+            return
+        try:
+            import TimeTagger as _TT
+            self._TT        = _TT
+            self._tagger    = _TT.createTimeTagger()
+            self._countrate = _TT.Countrate(
+                tagger=self._tagger,
+                channels=[self.channel_h, self.channel_v],
+            )
+            print(f"  Time Tagger connected "
+                  f"(H=ch{self.channel_h}, V=ch{self.channel_v})")
+        except ImportError:
+            raise RuntimeError(
+                "TimeTagger module not found. "
+                "Install the Swabian Instruments Time Tagger software."
+            )
+
+    def disconnect(self) -> None:
+        if self._tagger is not None:
+            self._TT.freeTimeTagger(self._tagger)
+            self._tagger    = None
+            self._countrate = None
+
+    def read_raw_rates(self) -> tuple:
+        """Return (rate_h, rate_v) in Hz averaged over integration_time_s."""
+        integration_ps = int(self.integration_time_s * 1e12)
+        self._countrate.startFor(integration_ps, clear=True)
+        self._countrate.waitUntilFinished()
+        data = self._countrate.getData()
+        return float(data[0]), float(data[1])
+
+    def read_detection(self, alice_state, bob_basis) -> Optional[DetectorPort]:
+        """
+        Measure both channels, subtract dark counts, apply efficiency
+        correction, and return the winning DetectorPort.
+        Returns None on a loss event (both net rates <= 0).
+        """
+        if self.simulate:
+            return self._simulate(alice_state, bob_basis)
+
+        rate_h, rate_v = self.read_raw_rates()
+        net_h = rate_h - self.dark_rate_h
+        net_v = rate_v - self.dark_rate_v
+        net_v_corrected = net_v * self.efficiency_ratio
+
+        if net_h <= 0 and net_v_corrected <= 0:
+            return None
+        return DetectorPort.H_PORT if net_h >= net_v_corrected else DetectorPort.V_PORT
+
+    def _simulate(self, alice_state, bob_basis) -> DetectorPort:
+        if alice_state.basis == bob_basis:
+            correct = DetectorPort.H_PORT if alice_state.bit == Bit.ZERO else DetectorPort.V_PORT
+            wrong   = DetectorPort.V_PORT if alice_state.bit == Bit.ZERO else DetectorPort.H_PORT
+            return wrong if random.random() < self.error_rate else correct
+        return random.choice(list(DetectorPort))
+
+
+class HardwareLayer:
+    """
+    Owns the two KLC101 controllers and the detector.
+    Maps AliceState -> (LCVR1_voltage, LCVR2_voltage).
+    """
+
+    _STATE_MAP = {
+        AliceState(Basis.HV, Bit.ZERO): (False, False),  # H
+        AliceState(Basis.DA, Bit.ZERO): (True,  False),  # D
+        AliceState(Basis.HV, Bit.ONE ): (False, True ),  # V
+        AliceState(Basis.DA, Bit.ONE ): (True,  True ),  # A
+    }
+
+    def __init__(self, lcvr1, lcvr2, detector,
+                 v_low_lcvr1, v_low_lcvr2,
+                 v_high=20.0, carrier_freq_hz=2000):
+        self.lcvr1        = lcvr1
+        self.lcvr2        = lcvr2
+        self.detector     = detector
+        self.v_low_lcvr1  = v_low_lcvr1
+        self.v_low_lcvr2  = v_low_lcvr2
+        self.v_high       = v_high
+        self.carrier_freq = carrier_freq_hz
+
+    def connect(self):
+        self.lcvr1.connect()
+        self.lcvr2.connect()
+        self.detector.load_calibration()
+        self.detector.connect()
+
+    def disconnect(self):
+        self.lcvr1.disconnect()
+        self.lcvr2.disconnect()
+        self.detector.disconnect()
+
+    def prepare_state(self, state):
+        lcvr1_low, lcvr2_low = self._STATE_MAP[state]
+        v1 = self.v_low_lcvr1 if lcvr1_low else self.v_high
+        v2 = self.v_low_lcvr2 if lcvr2_low else self.v_high
+        self.lcvr1.set_voltage(v1, self.carrier_freq)
+        self.lcvr2.set_voltage(v2, self.carrier_freq)
+
+    def read_detection(self, alice_state, bob_basis):
+        return self.detector.read_detection(alice_state, bob_basis)
+
+
+# =============================================================================
+# CALIBRATION UTILITY
+# =============================================================================
+
+def calibrate_v_low(controller, v_start=2.0, v_end=6.0, v_step=0.1, dwell_s=0.5):
+    """
+    Sweep voltage and prompt user to record extinction ratio at each step.
+    V_LOW is the voltage that maximises extinction (best HWP behaviour).
+
+    Run with H-polarised input and an analyser oriented to extinguish the
+    expected output state of a perfect HWP at your target slow-axis angle.
+    Run once per LCVR before the main experiment.
+    """
+    print("\nCalibration sweep — record power meter reading at each voltage.")
+    print(f"{'Voltage (V)':>12}  {'Reading':>10}")
+    print("-" * 26)
+    controller.connect()
+    v = v_start
+    while v <= v_end + 1e-9:
+        controller.set_voltage(round(v, 3))
+        time.sleep(dwell_s)
+        reading = input(f"  {v:>8.2f} V   ").strip()
+        v = round(v + v_step, 6)
+    controller.disconnect()
+    print("\nV_LOW = voltage with maximum extinction ratio.")
+
+
+# =============================================================================
+# PROTOCOL LAYER
+# =============================================================================
+
+class BB84Protocol:
+    """
+    All BB84 logic lives here. Replace or subclass for other protocols.
+    """
+
+    @staticmethod
+    def alice_choose_state():
+        """Random basis and bit. Swap in a QRNG call if available."""
+        return AliceState(
+            basis=random.choice(list(Basis)),
+            bit=random.choice(list(Bit)),
+        )
+
+    @staticmethod
+    def bob_choose_basis_interactive():
+        """Prompt Bob to enter his basis."""
+        while True:
+            raw = input("\nBob — choose basis  [0 = H/V,  1 = D/A]: ").strip()
+            if raw == '0': return Basis.HV
+            if raw == '1': return Basis.DA
+            print("  Enter 0 or 1.")
+
+    @staticmethod
+    def bases_match(alice_basis, bob_basis):
+        return alice_basis == bob_basis
+
+    @staticmethod
+    def detector_port_to_bit(port):
+        return 0 if port == DetectorPort.H_PORT else 1
+
+    @staticmethod
+    def sift(records):
+        return [r for r in records if r.bases_match]
+
+
+# =============================================================================
+# EXPERIMENT RUNNER
+# =============================================================================
+
+class ExperimentRunner:
+    """
+    Runs N rounds of BB84, records everything, prints summary, saves CSV.
+
+    settle_time_s should exceed the LCVR switching time.
+    At 635 nm the LCC1511-B spec is ~3 ms rise; 50 ms is a safe default.
+    """
+
+    def __init__(self, hardware, protocol, n_rounds=100,
+                 output_csv="bb84_results.csv", settle_time_s=0.05):
+        self.hw          = hardware
+        self.protocol    = protocol
+        self.n_rounds    = n_rounds
+        self.output_csv  = output_csv
+        self.settle_time = settle_time_s
+        self.records     = []
+
+    def run(self):
+        print(f"\n{'='*55}")
+        print(f"  BB84 Experiment  —  {self.n_rounds} rounds")
+        print(f"{'='*55}\n")
+        self.hw.connect()
+        try:
+            for i in range(self.n_rounds):
+                r = self._run_round(i + 1)
+                self.records.append(r)
+                self._print_round(r)
+        finally:
+            self.hw.disconnect()
+        self._save_csv()
+        self._print_summary()
+        return self.records
+
+    def _run_round(self, n):
+        alice_state = self.protocol.alice_choose_state()
+        self.hw.prepare_state(alice_state)
+        time.sleep(self.settle_time)
+
+        bob_basis = self.protocol.bob_choose_basis_interactive()
+        port      = self.hw.read_detection(alice_state, bob_basis)
+        match     = self.protocol.bases_match(alice_state.basis, bob_basis)
+        sifted    = self.protocol.detector_port_to_bit(port) if (match and port) else None
+
+        return MeasurementRecord(
+            round_number  = n,
+            alice_basis   = alice_state.basis,
+            alice_bit     = alice_state.bit,
+            alice_state   = alice_state.label,
+            bob_basis     = bob_basis,
+            detector_port = port,
+            bases_match   = match,
+            sifted_bit    = sifted,
+        )
+
+    def _print_round(self, r):
+        port  = r.detector_port.name if r.detector_port else "LOSS"
+        match = "MATCH" if r.bases_match else "DISCARD"
+        bit   = str(r.sifted_bit) if r.sifted_bit is not None else "-"
+        print(f"  Round {r.round_number:>3} | Alice: {r.alice_state} ({r.alice_basis.name})"
+              f" | Bob: {r.bob_basis.name} | Det: {port:<6} | {match:<7} | bit: {bit}")
+
+    def _print_summary(self):
+        sifted   = self.protocol.sift(self.records)
+        n_total  = len(self.records)
+        n_sifted = len(sifted)
+        if n_sifted == 0:
+            print("\n  No sifted bits.")
+            return
+        errors     = sum(1 for r in sifted if r.sifted_bit is not None
+                         and r.sifted_bit != r.alice_bit.value)
+        qber       = errors / n_sifted
+        key_string = ''.join(str(r.sifted_bit) for r in sifted if r.sifted_bit is not None)
+        print(f"\n{'='*55}")
+        print(f"  Total rounds      : {n_total}")
+        print(f"  Sifted bits       : {n_sifted}  ({100*n_sifted/n_total:.1f}%)")
+        print(f"  QBER              : {100*qber:.1f}%")
+        print(f"  Efficiency ratio  : {self.hw.detector.efficiency_ratio:.3f}")
+        print(f"  Sifted key        : {key_string}")
+        print(f"  Saved to          : {self.output_csv}")
+
+    def _save_csv(self):
+        with open(self.output_csv, 'w', newline='') as f:
+            fields = ['round', 'alice_basis', 'alice_bit', 'alice_state',
+                      'bob_basis', 'detector_port', 'bases_match', 'sifted_bit',
+                      'efficiency_ratio']
+            w = csv.DictWriter(f, fieldnames=fields)
+            w.writeheader()
+            ratio = self.hw.detector.efficiency_ratio
+            for r in self.records:
+                w.writerow({
+                    'round'            : r.round_number,
+                    'alice_basis'      : r.alice_basis.name,
+                    'alice_bit'        : r.alice_bit.value,
+                    'alice_state'      : r.alice_state,
+                    'bob_basis'        : r.bob_basis.name,
+                    'detector_port'    : r.detector_port.name if r.detector_port else 'LOSS',
+                    'bases_match'      : r.bases_match,
+                    'sifted_bit'       : '' if r.sifted_bit is None else r.sifted_bit,
+                    'efficiency_ratio' : f"{ratio:.4f}",
+                })
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
+
+if __name__ == "__main__":
+
+    # ── Configuration ─────────────────────────────────────────────────────────
+    SIMULATE = True      # False when running on real hardware
+
+    # Prefer SN over port — more robust if USB enumeration order changes.
+    # Leave both None only if a single KLC101 is connected (auto-detect).
+    SN_LCVR1   = None    # e.g. '39000001'     LCVR 1, slow axis at 22.5 deg
+    SN_LCVR2   = None    # e.g. '39000002'     LCVR 2, slow axis at 45 deg
+    PORT_LCVR1 = None    # e.g. '/dev/ttyUSB0' fallback if SN not used
+    PORT_LCVR2 = None    # e.g. '/dev/ttyUSB1'
+
+    # V_LOW must be determined by optical calibration for each LCVR at 635 nm.
+    # These are placeholders — run calibrate_v_low() in the original code first.
+    V_LOW_LCVR1  = 3.2   # V
+    V_LOW_LCVR2  = 3.2   # V
+
+    V_HIGH       = 20.0  # V   near-zero retardance, identity
+    CARRIER_FREQ = 2000  # Hz  carrier frequency — does not affect retardance
+
+    # Integration time per detection window in seconds.
+    # Longer = lower shot noise but slower rounds.
+    INTEGRATION_TIME_S = 0.5
+
+    N_ROUNDS   = 20
+    OUTPUT_CSV = f"bb84_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # calibration.json must exist in the same directory — run calibrate.py first.
+    hardware = HardwareLayer(
+        lcvr1           = KLC101Controller(port=PORT_LCVR1, sn=SN_LCVR1, v_high=V_HIGH, simulate=SIMULATE),
+        lcvr2           = KLC101Controller(port=PORT_LCVR2, sn=SN_LCVR2, v_high=V_HIGH, simulate=SIMULATE),
+        detector        = DetectorInterface(integration_time_s=INTEGRATION_TIME_S, simulate=SIMULATE),
+        v_low_lcvr1     = V_LOW_LCVR1,
+        v_low_lcvr2     = V_LOW_LCVR2,
+        v_high          = V_HIGH,
+        carrier_freq_hz = CARRIER_FREQ,
+    )
+
+    ExperimentRunner(
+        hardware      = hardware,
+        protocol      = BB84Protocol(),
+        n_rounds      = N_ROUNDS,
+        output_csv    = OUTPUT_CSV,
+        settle_time_s = 0.05,
+    ).run()
