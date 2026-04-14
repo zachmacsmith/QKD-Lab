@@ -154,6 +154,21 @@ class KLC101Device:
 
     def connect(self) -> None:
         DeviceManagerCLI.BuildDeviceList()
+        time.sleep(0.5)   # allow USB enumeration to complete
+
+        # Verify device is visible before trying to create it
+        device_list = DeviceManagerCLI.GetDeviceList()
+        available   = list(device_list)
+        print(f"  Available Kinesis devices: {available}")
+
+        if self.sn not in available:
+            raise RuntimeError(
+                f"KLC101 serial {self.sn!r} not found in device list.\n"
+                f"Available: {available}\n"
+                "  → Check USB connection\n"
+                "  → Close Kinesis / EDU-QOP1 software before running this script"
+            )
+
         self._device = KCubeLiquidCrystal.CreateKCubeLiquidCrystal(self.sn)
         self._device.Connect(self.sn)
         self._device.WaitForSettingsInitialized(3000)
