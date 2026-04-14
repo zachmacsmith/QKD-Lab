@@ -24,20 +24,23 @@ for root in search_roots:
 
 import struct
 print(struct.calcsize("P") * 8, "bit Python")
+from System import Decimal
 
-import sys
-import clr
+DeviceManagerCLI.BuildDeviceList()
 
-KINESIS = r"C:\Program Files\Thorlabs\EDU-QOP1"
-sys.path.insert(0, KINESIS)
+device = KCubeLiquidCrystal.CreateKCubeLiquidCrystal('39443416')
+device.Connect('39443416')
+device.WaitForSettingsInitialized(3000)
+device.StartPolling(250)
 
-clr.AddReference(r"C:\Program Files\Thorlabs\EDU-QOP1\Thorlabs.MotionControl.DeviceManagerCLI.dll")
-clr.AddReference(r"C:\Program Files\Thorlabs\EDU-QOP1\Thorlabs.MotionControl.KCube.LiquidCrystalCLI.dll")
+import time
+time.sleep(0.5)
+device.EnableDevice()
+time.sleep(0.5)
 
-from Thorlabs.MotionControl.DeviceManagerCLI import *
-from Thorlabs.MotionControl.KCube.LiquidCrystalCLI import *
+params = device.GetPresetParams(1)   # get preset 1
+print(type(params))
+print([m for m in dir(params) if not m.startswith('_')])
 
-# List all public methods on the KLC101 class
-methods = [m for m in dir(KCubeLiquidCrystal) if not m.startswith('_')]
-for m in sorted(methods):
-    print(m)
+device.StopPolling()
+device.Disconnect()
