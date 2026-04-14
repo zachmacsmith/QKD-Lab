@@ -24,3 +24,10 @@ for root in search_roots:
 
 import struct
 print(struct.calcsize("P") * 8, "bit Python")
+
+import pathlib
+
+p = pathlib.Path(r"C:\Program Files\Thorlabs\EDU-QOP1")
+print("Exists:", p.exists())
+for dll in sorted(p.rglob("*.dll")):
+    print(dll.relative_to(p))
