@@ -25,9 +25,19 @@ for root in search_roots:
 import struct
 print(struct.calcsize("P") * 8, "bit Python")
 
-import pathlib
+import sys
+import clr
 
-p = pathlib.Path(r"C:\Program Files\Thorlabs\EDU-QOP1")
-print("Exists:", p.exists())
-for dll in sorted(p.rglob("*.dll")):
-    print(dll.relative_to(p))
+KINESIS = r"C:\Program Files\Thorlabs\EDU-QOP1"
+sys.path.insert(0, KINESIS)
+
+clr.AddReference(r"C:\Program Files\Thorlabs\EDU-QOP1\Thorlabs.MotionControl.DeviceManagerCLI.dll")
+clr.AddReference(r"C:\Program Files\Thorlabs\EDU-QOP1\Thorlabs.MotionControl.KCube.LiquidCrystalCLI.dll")
+
+from Thorlabs.MotionControl.DeviceManagerCLI import *
+from Thorlabs.MotionControl.KCube.LiquidCrystalCLI import *
+
+# List all public methods on the KLC101 class
+methods = [m for m in dir(KCubeLiquidCrystal) if not m.startswith('_')]
+for m in sorted(methods):
+    print(m)
