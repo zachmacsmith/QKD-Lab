@@ -24,7 +24,7 @@ for root in search_roots:
 
 import struct
 print(struct.calcsize("P") * 8, "bit Python")
-from System import Decimal
+from sys import Decimal
 
 DeviceManagerCLI.BuildDeviceList()
 
