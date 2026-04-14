@@ -40,11 +40,22 @@ import datetime
 import pathlib
 import math
 
+# Thorlabs Kinesis via pythonnet — no KLCserial needed
+# pip install pythonnet
+KINESIS_PATH = r"C:\Program Files\Thorlabs\EDU-QOP1"
+KINESIS_AVAILABLE = False
 try:
-    from KLCserial import KLC
-    KLC_AVAILABLE = True
-except ImportError:
-    KLC_AVAILABLE = False
+    import clr
+    import sys as _sys
+    _sys.path.insert(0, KINESIS_PATH)
+    clr.AddReference(KINESIS_PATH + r"\Thorlabs.MotionControl.DeviceManagerCLI.dll")
+    clr.AddReference(KINESIS_PATH + r"\Thorlabs.MotionControl.KCube.LiquidCrystalCLI.dll")
+    from Thorlabs.MotionControl.DeviceManagerCLI import DeviceManagerCLI
+    from Thorlabs.MotionControl.KCube.LiquidCrystalCLI import KCubeLiquidCrystal
+    from System import Decimal as _Decimal
+    KINESIS_AVAILABLE = True
+except Exception as _e:
+    print(f"  Kinesis not available: {_e}")
 
 import sys
 # Swabian Instruments installs the TimeTagger module to a non-standard path
@@ -81,8 +92,8 @@ except ImportError:
 # =============================================================================
 
 # KLC101 identification. Use SN (preferred) or port. None = auto-detect.
-SN_LCVR1   = '39443416'          # e.g. '39000001'  — LCVR 1, slow axis 22.5 deg
-SN_LCVR2   = '39443413'          # e.g. '39000002'  — LCVR 2, slow axis 45 deg
+SN_LCVR1   = None          # e.g. '39000001'  — LCVR 1, slow axis 22.5 deg
+SN_LCVR2   = None          # e.g. '39000002'  — LCVR 2, slow axis 45 deg
 PORT_LCVR1 = None          # e.g. '/dev/tty.usbserial-XXXX'
 PORT_LCVR2 = None          # e.g. '/dev/tty.usbserial-YYYY'
 
@@ -121,12 +132,86 @@ SIMULATE = False            # True = run without hardware for testing
 # HARDWARE HELPERS
 # =============================================================================
 
-def connect_klc(sn, port):
-    if sn:
-        return KLC(SN=sn)
-    if port:
-        return KLC(port=port)
-    return KLC()
+class KLC101Device:
+    """
+    Thin wrapper around the Thorlabs Kinesis KCubeLiquidCrystal .NET class.
+    Provides set_voltage() and set_freq() matching the interface the rest
+    of this script expects.
+
+    If set_voltage() raises AttributeError, the preset params field name
+    may differ in your Kinesis version. Run:
+        params = device._device.GetPresetParams(1)
+        print([m for m in dir(params) if not m.startswith('_')])
+    to find the correct field name and update _VOLTAGE_FIELD below.
+    """
+
+    _VOLTAGE_FIELD = "Voltage1"       # field name on preset params object
+    _FREQ_FIELD    = "OutputFrequency" # field name on preset params object
+
+    def __init__(self, sn: str):
+        self.sn      = sn
+        self._device = None
+
+    def connect(self) -> None:
+        DeviceManagerCLI.BuildDeviceList()
+        self._device = KCubeLiquidCrystal.CreateKCubeLiquidCrystal(self.sn)
+        self._device.Connect(self.sn)
+        self._device.WaitForSettingsInitialized(3000)
+        self._device.StartPolling(250)
+        time.sleep(0.5)
+        self._device.EnableDevice()
+        time.sleep(0.25)
+        print(f"  KLC101 {self.sn}: connected via Kinesis")
+
+    def set_voltage(self, voltage: float) -> None:
+        """Set preset 1 voltage (V). Controls LC retardance."""
+        params = self._device.GetPresetParams(1)
+        try:
+            setattr(params, self._VOLTAGE_FIELD, _Decimal(voltage))
+        except AttributeError:
+            available = [m for m in dir(params) if not m.startswith('_')]
+            raise AttributeError(
+                f"Field '{self._VOLTAGE_FIELD}' not found on preset params.\n"
+                f"Available fields: {available}\n"
+                f"Update KLC101Device._VOLTAGE_FIELD with the correct name."
+            )
+        self._device.SetPresetParams(1, params)
+
+    def set_freq(self, freq: int) -> None:
+        """Set preset 1 carrier frequency (Hz)."""
+        params = self._device.GetPresetParams(1)
+        try:
+            setattr(params, self._FREQ_FIELD, _Decimal(freq))
+        except AttributeError:
+            available = [m for m in dir(params) if not m.startswith('_')]
+            raise AttributeError(
+                f"Field '{self._FREQ_FIELD}' not found on preset params.\n"
+                f"Available fields: {available}\n"
+                f"Update KLC101Device._FREQ_FIELD with the correct name."
+            )
+        self._device.SetPresetParams(1, params)
+
+    def en_hwchan(self) -> None:
+        self._device.EnableDevice()
+
+    def dis_hwchan(self) -> None:
+        self._device.DisableDevice()
+
+    def disconnect(self) -> None:
+        if self._device is not None:
+            try:
+                self._device.StopPolling()
+                self._device.Disconnect()
+            except Exception:
+                pass
+            self._device = None
+
+
+def connect_klc(sn: str, _port=None) -> KLC101Device:
+    """Connect to a KLC101 by serial number using Kinesis DLLs."""
+    device = KLC101Device(sn)
+    device.connect()
+    return device
 
 
 def set_voltages(klc1, klc2, v1: float, v2: float) -> None:
@@ -371,20 +456,18 @@ def run_calibration() -> dict:
             raise RuntimeError(
                 "TimeTagger not found. Install Swabian Instruments software."
             )
-        if not KLC_AVAILABLE:
+        if not KINESIS_AVAILABLE:
             raise RuntimeError(
-                "KLCserial not found. Run: pip install serial pyserial KLCserial"
+                f"Kinesis DLLs not loaded. Check KINESIS_PATH = {KINESIS_PATH!r}"
             )
         print("  Connecting Time Tagger...")
         tagger    = TimeTagger.createTimeTagger()
         countrate = TimeTagger.Countrate(
             tagger=tagger, channels=[CHANNEL_H, CHANNEL_V]
         )
-        print("  Connecting KLC101 controllers...")
-        klc1 = connect_klc(SN_LCVR1, PORT_LCVR1)
-        klc2 = connect_klc(SN_LCVR2, PORT_LCVR2)
-        klc1.en_hwchan()
-        klc2.en_hwchan()
+        print("  Connecting KLC101 controllers via Kinesis...")
+        klc1 = connect_klc(SN_LCVR1)
+        klc2 = connect_klc(SN_LCVR2)
         klc1.set_freq(CARRIER_FREQ)
         klc2.set_freq(CARRIER_FREQ)
     else:
@@ -592,8 +675,8 @@ def run_calibration() -> dict:
         set_voltages(klc1, klc2, V_HIGH, V_HIGH)
         klc1.dis_hwchan()
         klc2.dis_hwchan()
-        klc1.closeKLC()
-        klc2.closeKLC()
+        klc1.disconnect()
+        klc2.disconnect()
         TimeTagger.freeTimeTagger(tagger)
 
     print(f"\n  Saved: {CALIBRATION_FILE.name}")
