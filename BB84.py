@@ -233,6 +233,11 @@ class DetectorInterface:
         if self.simulate:
             print("  [SIM] Detector: connected")
             return
+        # Add Swabian's non-standard install path so Python can find the module
+        import sys
+        _tt_path = r"C:\Program Files\Swabian Instruments\Time Tagger\driver\python"
+        if _tt_path not in sys.path:
+            sys.path.insert(0, _tt_path)
         try:
             import TimeTagger as _TT
             self._TT        = _TT
@@ -245,8 +250,9 @@ class DetectorInterface:
                   f"(H=ch{self.channel_h}, V=ch{self.channel_v})")
         except ImportError:
             raise RuntimeError(
-                "TimeTagger module not found. "
-                "Install the Swabian Instruments Time Tagger software."
+                "TimeTagger module not found.\n"
+                "Install the Swabian Instruments Time Tagger software, or\n"
+                f"check that the driver exists at:\n  {_tt_path}"
             )
 
     def disconnect(self) -> None:
