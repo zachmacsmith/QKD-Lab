@@ -21,3 +21,6 @@ search_roots = [
 for root in search_roots:
     for p in pathlib.Path(root).rglob("Thorlabs.MotionControl.DeviceManagerCLI.dll"):
         print(p.parent)
+
+import struct
+print(struct.calcsize("P") * 8, "bit Python")
